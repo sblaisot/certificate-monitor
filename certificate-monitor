@@ -1,0 +1,149 @@
+#!/bin/bash
+
+### CONFIGURATION DEFAULTS ###
+
+# Warn if a certificate expires in less than this time period
+WARN_TIME="3 weeks"
+
+# print warnings to STDOUT (true or false)
+WARN_STDOUT=false
+
+# Send warnings by mail (true or false)
+WARN_MAIL=true
+
+# Where to send mail alerts (if WARN_MAIL set to true)
+SEND_WARNING_MAIL_TO="yourmail@domain.example"
+SEND_WARNING_MAIL_FROM="youemail@domain.example"
+
+# List of certificates to monitor. Adapt to your settings.
+APACHE_CERT_LIST=$(grep -e '^[[:space:]]*SSLCertificateFile' /etc/apache2/sites-enabled/* | sed 's,^.*SSLCertificateFile[[:space:]]\(.*\)$,\1,')
+DOVECOT_CERT_LIST=$(grep -e '^[^\#]*ssl_cert[[:space:]]*=[[:space:]]*<' /etc/dovecot/conf.d/* | sed 's,^[^\#]*ssl_cert[[:space:]]*=[[:space:]]*<\(.*\)$,\1,')
+POSTFIX_CERT_LIST=$(grep -e '^[^\#]*smtpd_tls_cert_file[[:space:]]*=[[:space:]]*' /etc/postfix/main.cf | sed 's,^[^\#]*smtpd_tls_cert_file[[:space:]]*=[[:space:]]*\(.*\)$,\1,')
+
+### DO NOT MODIFY ANYTHING BELOW UNLESS YOU EXACTLY KNOW WHAT YOU ARE DOING ###
+
+# Usage function
+function usage {
+  echo "USAGE: $(basename $0) [-h] [-d] [-e <warning_time>] [-m] [-f <sender>] [-t <destination>] [-s] [-q]"
+  echo ""
+  echo "Options:"
+  echo "  -h, --help    print usage message and exit"
+  echo "  -d, --debug   debug mode, show expiration date of older certs even if not in warning time period (only on STDOUT)"
+  echo "  -e <time>,    warn if cert expires in the given time period"
+  echo "  --expirein <time>"
+  echo "  -m, --mail    send warning by mail"
+  echo "  -f <sender>,  set warning mail sender address"
+  echo "  --from <sender>"
+  echo "  -t <dest>,    set warning mail destination address"
+  echo "  --to <dest>"
+  echo "  --nomail      do NOT send warning by mail even if enabled by default"
+  echo "  -s, --stdout  show warnings on stdout"
+  echo "  -q, --quiet   do NOT show warnings on stdout, even if enabled by default"
+  echo ""
+}
+
+DEBUG=false
+MYHOSTNAME=$(hostname -s)
+
+# Options parsing
+
+PARSED_OPTIONS=$(getopt -n "$0"  -o hde:msqf:t: --long "help,debug,expirein:,mail,stdout,quiet,from:,to:,nomail,nostdout"  -- "$@")
+
+if [ $? -ne 0 ];
+then
+  echo "" >&2
+  usage >&2
+  exit 1
+fi
+
+eval set -- "$PARSED_OPTIONS"
+
+while true; do
+  case "$1" in
+    -h|--help)
+      usage >&2
+      exit 1
+      ;;
+    -d|--debug)
+      DEBUG=true
+      shift
+      ;;
+    -e|--expirein)
+      case "$2" in
+        "") shift 2 ;;
+        *) WARN_TIME=$2 ; shift 2;;
+      esac
+      ;;
+    -m|--mail)
+      WARN_MAIL=true
+      shift
+      ;;
+    -f|--from)
+      case "$2" in
+        "") shift 2 ;;
+        *) SEND_WARNING_MAIL_FROM=$2 ; shift 2;;
+      esac
+      ;;
+    -t|--to)
+       case "$2" in
+        "") shift 2 ;;
+        *) SEND_WARNING_MAIL_TO=$2 ; shift 2;;
+      esac
+      ;;
+    --nomail)
+      WARN_MAIL=false
+      shift
+      ;;
+    -s|--stdout)
+      WARN_STDOUT=true
+      shift
+      ;;
+    -q|--quiet|--nostdout)
+      WARN_STDOUT=false
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+  esac
+done
+
+# Warn time limit since epoch
+WARN_EPOCH=$(date --date "+${WARN_TIME}" +"%s")
+
+# For each cert
+for cert in ${APACHE_CERT_LIST} ${DOVECOT_CERT_LIST} ${POSTFIX_CERT_LIST}; do
+
+  # Get expiration time of next expiring cert
+  N=$(openssl x509 -noout -enddate -in $cert | sed -n 's/notAfter=//p')
+
+  # Transform to epoch (usefull for date comparison)
+  EXP_EPOCH=$(date --date "${N}" +"%s")
+  EXP_HUMANREADABLE=$(LANG=C date --date "${N}")
+
+  # Warn if in expiration warning time
+  if [ ${EXP_EPOCH} -le ${WARN_EPOCH} ]; then
+    WARN_MSG="\
+
+CERTIFICATE EXPIRATION WARNING
+------------------------------
+
+Certificate ${cert} is expiring in less than ${WARN_TIME}
+Expiration date on (${EXP_EPOCH}) ${EXP_HUMANREADABLE}
+"
+    $WARN_STDOUT && echo -e "${WARN_MSG}"
+    if $WARN_MAIL; then
+      WARN_MAIL_HEADERS="\
+From: ${SEND_WARNING_MAIL_FROM}
+To: <${SEND_WARNING_MAIL_TO}>
+Subject: ***CERTIFICATE EXPIRATION WARNING ON ${MYHOSTNAME}***
+Date: $(date -R)
+"
+      echo -e "${WARN_MAIL_HEADERS}\n${WARN_MSG}" | sendmail -t -oi -f "${SEND_WARNING_MAIL_FROM}"
+    fi
+  else
+    $DEBUG && echo "Expiration of cert ${cert} (no warning) on (${EXP_EPOCH}) ${EXP_HUMANREADABLE}"
+  fi
+done
+exit 0
